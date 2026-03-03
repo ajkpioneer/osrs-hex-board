@@ -58,6 +58,7 @@
 <div class="team-tabs" id="teamTabs"></div>
 
 <div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#7a3a0a"></div><span>Outer (pick to start)</span></div>
   <div class="legend-item"><div class="legend-swatch" style="background:#555"></div><span>Locked</span></div>
   <div class="legend-item"><div class="legend-swatch" style="background:#888"></div><span>Unlocked</span></div>
   <div class="legend-item"><div class="legend-swatch" style="background:#22c55e"></div><span>Completed</span></div>
@@ -301,7 +302,7 @@ function buildAdj(){
 const ADJ=buildAdj();
 const OUTER=Object.entries(RING).filter(([,r])=>r===6).map(([t])=>Number(t));
 
-const STATE_NONE=0,STATE_AVAIL=1,STATE_DONE=2;
+const STATE_NONE=0,STATE_AVAIL=1,STATE_DONE=2,STATE_START=3;
 
 // ── Team state ────────────────────────────────────────────────────────────────
 const DEFAULT_TEAM_NAMES=["tahx","heavywanchor","aquilly","dauwe","bbmaster360","shepherd","ramazody","hox","babewatch"];
@@ -319,35 +320,43 @@ function setSyncStatus(status){
   label.textContent=status==="connected"?"Live — all changes sync instantly":status==="syncing"?"Saving...":"Connection error — retrying";
 }
 
-// Listen to all team data from Firebase in real time
+// Listen to ALL board data in real time — fires on every remote change
 const boardRef=ref(db,"board");
 onValue(boardRef,(snapshot)=>{
-  const data=snapshot.val();
-  if(data&&data.teams){
-    data.teams.forEach((t,i)=>{
-      if(t){
-        teamData[i].name=t.name||DEFAULT_TEAM_NAMES[i];
-        teamData[i].ts=t.ts||{};
-      }
-    });
+  const data=snapshot.val()||{};
+  const teams=data.teams||{};
+  // teams is a plain object keyed "0".."8"
+  for(let i=0;i<9;i++){
+    const t=teams[i]||teams[String(i)]||{};
+    teamData[i].name=t.name||DEFAULT_TEAM_NAMES[i];
+    // ts comes back from Firebase as {"1":2,"5":2} — keep as-is, normalise keys to Number on read
+    const raw=t.ts||{};
+    const normalised={};
+    for(const k of Object.keys(raw)) normalised[Number(k)]=raw[k];
+    teamData[i].ts=normalised;
   }
   setSyncStatus("connected");
   renderTabs();
   renderBoard();
   renderStats();
 },(error)=>{
+  console.error("Firebase error:",error);
   setSyncStatus("error");
 });
 
 // Write a single team's state to Firebase
+// Firebase doesn't store numeric keys — convert ts to string-keyed object
 function pushTeam(idx){
   setSyncStatus("syncing");
   const teamRef=ref(db,`board/teams/${idx}`);
+  const ts=teamData[idx].ts;
+  const tsOut={};
+  for(const k of Object.keys(ts)) tsOut[String(k)]=ts[k];
   set(teamRef,{
-    name:teamData[idx].name,
-    ts:teamData[idx].ts
+    name:teamData[idx].name||DEFAULT_TEAM_NAMES[idx],
+    ts:tsOut
   }).then(()=>setSyncStatus("connected"))
-    .catch(()=>setSyncStatus("error"));
+    .catch((e)=>{console.error("Push error:",e);setSyncStatus("error");});
 }
 
 // ── Rename logic ──────────────────────────────────────────────────────────────
@@ -383,15 +392,24 @@ document.getElementById("renameInput").addEventListener("keydown",e=>{
 
 // ── Cycle tile state ──────────────────────────────────────────────────────────
 function cycleState(tid){
-  const cur=teamData[activeTeam].ts[tid]||0;
-  teamData[activeTeam].ts[tid]=cur===2?0:2; // toggle done/undone
+  const cur=teamData[activeTeam].ts[Number(tid)]||0;
+  const isOuter=RING[tid]===6;
+  let next;
+  if(isOuter){
+    // Outer ring: locked -> start -> done -> locked
+    next=cur===0?STATE_START:cur===STATE_START?STATE_DONE:0;
+  } else {
+    // Inner tiles: locked -> done -> locked
+    next=cur===STATE_DONE?0:STATE_DONE;
+  }
+  teamData[activeTeam].ts[Number(tid)]=next;
   pushTeam(activeTeam);
   renderBoard();
   renderStats();
 }
 
 // ── Layout ────────────────────────────────────────────────────────────────────
-const R=36,HW=Math.sqrt(3)*R,RH=R*1.5;
+const R=46,HW=Math.sqrt(3)*R,RH=R*1.5;
 const maxCols=Math.max(...ROWS.map(r=>r.length));
 const SW=(maxCols+0.5)*HW+24,SH=ROWS.length*RH+R+20;
 const NS="http://www.w3.org/2000/svg";
@@ -477,18 +495,16 @@ function renderBoard(){
   const svg=document.getElementById("board");
   const td=teamData[activeTeam];
 
-  // Compute which tiles are clickable (adjacent to done, or outer ring if nothing done yet)
-  const clickable=new Set();
-  const anyDone=Object.values(td.ts).some(s=>s===STATE_DONE);
-  if(!anyDone){
-    // Game hasn't started — outer ring tiles are clickable to pick a start
-    OUTER.forEach(t=>{ if((td.ts[t]||0)!==STATE_DONE) clickable.add(t); });
-  } else {
-    // Normal play — only tiles adjacent to completed ones are clickable
-    for(let id=1;id<=91;id++){
-      if((td.ts[id]||0)===STATE_DONE){
-        ADJ[id].forEach(nb=>{ if((td.ts[nb]||0)!==STATE_DONE) clickable.add(nb); });
-      }
+  // Compute which tiles are unlocked
+  const unlocked=new Set();      // inner tiles: unlock from done OR start neighbours
+  const unlockedByDone=new Set(); // outer ring tiles: only unlock from DONE neighbours
+  for(let id=1;id<=91;id++){
+    const s=td.ts[id]||0;
+    if(s===STATE_DONE||s===STATE_START){
+      ADJ[id].forEach(nb=>{ if((td.ts[nb]||0)!==STATE_DONE) unlocked.add(nb); });
+    }
+    if(s===STATE_DONE){
+      ADJ[id].forEach(nb=>{ if((td.ts[nb]||0)!==STATE_DONE) unlockedByDone.add(nb); });
     }
   }
 
@@ -499,12 +515,24 @@ function renderBoard(){
     const rc=RING_COLOR[ring];
     const poly=g.querySelector("polygon");
 
-    let fill,stroke,opacity;
+    let fill,stroke,opacity=1;
+
     if(state===STATE_DONE){
-      fill="#22c55e"; stroke="#16a34a"; opacity=1;
-    } else {
+      // Completed — green
+      fill="#22c55e"; stroke="#16a34a";
+    } else if(state===STATE_START){
+      // Chosen starting tile — full tier 6 color, full brightness
       fill=rc.f; stroke=rc.s;
-      opacity=clickable.has(tid)?1:0.4;
+    } else if(ring===6&&unlockedByDone.has(tid)){
+      // Outer ring tile adjacent to a completed tile — show as unlocked (full tier color)
+      fill=rc.f; stroke=rc.s; opacity=1;
+    } else if(ring===6){
+      // Outer ring, not yet chosen — muted orange, always visible but distinct
+      fill="#7a3a0a"; stroke="#5a2a06"; opacity=1;
+    } else {
+      // Inner tile — full color if unlocked, dimmed if locked
+      fill=rc.f; stroke=rc.s;
+      opacity=unlocked.has(tid)?1:0.4;
     }
 
     poly.setAttribute("fill",fill);
@@ -559,11 +587,14 @@ const ttEl=document.getElementById("tooltip");
 function showTooltip(tid,e){
   const td2=teamData[activeTeam];
   const state=td2.ts[tid]||STATE_NONE;
-  // Recompute clickable for tooltip status
-  const clickable=new Set();
-  const anyDone2=Object.values(td2.ts).some(s=>s===STATE_DONE);
-  if(!anyDone2){OUTER.forEach(t=>{if((td2.ts[t]||0)!==STATE_DONE)clickable.add(t);});}
-  else{for(let id=1;id<=91;id++){if((td2.ts[id]||0)===STATE_DONE){ADJ[id].forEach(nb=>{if((td2.ts[nb]||0)!==STATE_DONE)clickable.add(nb);});}}}
+  // Recompute unlocked sets for tooltip status
+  const unlocked2=new Set();
+  const unlockedByDone2=new Set();
+  for(let id=1;id<=91;id++){
+    const s2=td2.ts[id]||0;
+    if(s2===STATE_DONE||s2===STATE_START){ADJ[id].forEach(nb=>{if((td2.ts[nb]||0)!==STATE_DONE)unlocked2.add(nb);});}
+    if(s2===STATE_DONE){ADJ[id].forEach(nb=>{if((td2.ts[nb]||0)!==STATE_DONE)unlockedByDone2.add(nb);});}
+  }
 
   // images
   const ttImgs=document.getElementById("ttImgs");
@@ -580,8 +611,16 @@ function showTooltip(tid,e){
   document.getElementById("ttName").textContent=`#${tid} — ${NAMES[tid]||""}`;
   document.getElementById("ttRing").textContent=(RING_NAMES[RING[tid]]||"")+" — "+tileScore(tid)+" pts";
   const ttState=document.getElementById("ttState");
-  ttState.textContent=state===STATE_DONE?"✅ Completed":clickable.has(tid)?"🔓 Unlocked":"🔒 Locked";
-  ttState.style.color=state===STATE_DONE?"#22c55e":clickable.has(tid)?"#aaa":"#666";
+  const isOuterTile=RING[tid]===6;
+  let stateText,stateColor;
+  if(state===STATE_DONE){stateText="✅ Completed";stateColor="#22c55e";}
+  else if(state===STATE_START){stateText="🟠 Starting Tile";stateColor="#c05810";}
+  else if(isOuterTile&&unlockedByDone2.has(tid)){stateText="🔓 Unlocked";stateColor="#aaa";}
+  else if(isOuterTile){stateText="🔒 Locked (pick to start)";stateColor="#7a3a0a";}
+  else if(unlocked2.has(tid)){stateText="🔓 Unlocked";stateColor="#aaa";}
+  else{stateText="🔒 Locked";stateColor="#666";}
+  ttState.textContent=stateText;
+  ttState.style.color=stateColor;
   document.getElementById("ttDesc").textContent=DESCS[tid]||"No description yet.";
   ttEl.style.display="block";
   moveTooltip(e);
